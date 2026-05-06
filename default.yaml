@@ -53,3 +53,11 @@ worldfm:
   image_size: 512
   version: sigma
   cfg_scale: 4.5
+  compile_model: true
+  compile_mode: reduce-overhead
+  vae_channels_last: true
+  vae_deterministic: true
+  compile_vae: true
+  compile_vae_mode: reduce-overhead
+  disable_vae_slicing: true
+  disable_vae_tiling: true

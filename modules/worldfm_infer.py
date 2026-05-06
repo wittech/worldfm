@@ -101,6 +101,14 @@ class WorldFMInprocessConfig:
     device: str = "cuda"
     weight_dtype: torch.dtype = torch.float16
     profile: bool = False
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
+    vae_channels_last: bool = True
+    vae_deterministic: bool = True
+    compile_vae: bool = True
+    compile_vae_mode: str = "reduce-overhead"
+    disable_vae_slicing: bool = True
+    disable_vae_tiling: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +152,93 @@ class WorldFMTriConditionInprocess:
             del model_sd["pos_embed"]
         model.load_state_dict(model_sd, strict=False)
         model.eval().to(cfg.weight_dtype)
+        warm_pos_embed = getattr(model, "warm_pos_embed_cache", None)
+        if callable(warm_pos_embed):
+            warm_pos_embed(
+                latent_hw=(latent_size, latent_size),
+                device=self.device,
+                dtype=cfg.weight_dtype,
+                width_multiplier=3,
+            )
+        self.model_compile_error: Optional[str] = None
+        if bool(cfg.compile_model):
+            try:
+                model.forward_with_dpmsolver = torch.compile(  # type: ignore[method-assign]
+                    model.forward_with_dpmsolver,
+                    mode=str(cfg.compile_mode),
+                    fullgraph=False,
+                    dynamic=False,
+                )
+                print(f"[WorldFM][Compile] torch.compile enabled for forward_with_dpmsolver mode={cfg.compile_mode}", flush=True)
+            except Exception as exc:
+                self.model_compile_error = repr(exc)
+                print(f"[WorldFM][Compile] torch.compile failed, fallback to eager: {exc}", flush=True)
         self.model = model
 
         vae = AutoencoderKL.from_pretrained(cfg.vae_path).to(self.device).to(cfg.weight_dtype)
+        if bool(cfg.disable_vae_slicing) and hasattr(vae, "disable_slicing"):
+            vae.disable_slicing()
+        if bool(cfg.disable_vae_tiling) and hasattr(vae, "disable_tiling"):
+            vae.disable_tiling()
+        if bool(cfg.vae_channels_last) and self.device.type == "cuda":
+            vae = vae.to(memory_format=torch.channels_last)
         vae.eval()
         self.vae = vae
+        self.vae_compile_error: Optional[str] = None
+        self._vae_compiled = False
+        self._vae_encode_impl = self._vae_encode_eager
+        self._vae_decode_impl = self._vae_decode_eager
+        if bool(cfg.compile_vae):
+            try:
+                self._vae_encode_impl = torch.compile(
+                    self._vae_encode_eager,
+                    mode=str(cfg.compile_vae_mode),
+                    fullgraph=False,
+                    dynamic=False,
+                )
+                self._vae_decode_impl = torch.compile(
+                    self._vae_decode_eager,
+                    mode=str(cfg.compile_vae_mode),
+                    fullgraph=False,
+                    dynamic=False,
+                )
+                self._vae_compiled = True
+                print(f"[WorldFM][Compile] torch.compile enabled for VAE wrappers mode={cfg.compile_vae_mode}", flush=True)
+            except Exception as exc:
+                self.vae_compile_error = repr(exc)
+                self._vae_encode_impl = self._vae_encode_eager
+                self._vae_decode_impl = self._vae_decode_eager
+                print(f"[WorldFM][Compile] VAE torch.compile failed, fallback to eager: {exc}", flush=True)
 
         self.max_sequence_length = max_sequence_length
+        self.vae_scale = getattr(self.vae.config, "scaling_factor", 0.13025)
+        self._diffusion = IDDPM("1000", learn_sigma=True, pred_sigma=True)
+        self._alphas = torch.from_numpy(self._diffusion.alphas_cumprod).to(device=self.device, dtype=torch.float32)
+        self._ts_999 = torch.tensor([999], device=self.device, dtype=torch.long)
+        self._ts_mid = torch.tensor([int(cfg.mid_t)], device=self.device, dtype=torch.long)
+        self._a_999 = (self._alphas[self._ts_999] ** 0.5).view(-1, 1, 1, 1)
+        self._s_999 = ((1 - self._alphas[self._ts_999]) ** 0.5).view(-1, 1, 1, 1)
+        self._a_mid = (self._alphas[self._ts_mid] ** 0.5).view(-1, 1, 1, 1)
+        self._s_mid = ((1 - self._alphas[self._ts_mid]) ** 0.5).view(-1, 1, 1, 1)
+        self._hw = torch.tensor(
+            [[float(self.target_hw[0]), float(self.target_hw[1])]],
+            device=self.device,
+            dtype=cfg.weight_dtype,
+        )
+        self._ar = torch.tensor(
+            [[float(self.target_hw[0]) / float(self.target_hw[1])]],
+            device=self.device,
+            dtype=cfg.weight_dtype,
+        )
+        self._caption_embs = torch.zeros(
+            1,
+            1,
+            self.max_sequence_length,
+            4096,
+            device=self.device,
+            dtype=cfg.weight_dtype,
+        )
+        self._null_y = self._caption_embs.clone()
         self._cond2_cached: Optional[torch.Tensor] = None
         self._cond2_latent_cached: Optional[torch.Tensor] = None
         self._cond2_candidates_paths: list = []
@@ -160,13 +248,63 @@ class WorldFMTriConditionInprocess:
         self._last_cond1_tensor: Optional[torch.Tensor] = None
         self._last_cond2_tensor: Optional[torch.Tensor] = None
 
+    def _vae_input(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(self.cfg.weight_dtype)
+        if bool(self.cfg.vae_channels_last) and x.ndim == 4 and x.device.type == "cuda":
+            return x.contiguous(memory_format=torch.channels_last)
+        return x
+
+    def _vae_encode_eager(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._vae_input(x)
+        latent_dist = self.vae.encode(x).latent_dist
+        if bool(self.cfg.vae_deterministic):
+            mode = getattr(latent_dist, "mode", None)
+            z = mode() if callable(mode) else latent_dist.mean
+        else:
+            z = latent_dist.sample()
+        return z * self.vae_scale
+
+    def _vae_decode_eager(self, z: torch.Tensor) -> torch.Tensor:
+        z = z / self.vae_scale
+        if bool(self.cfg.vae_channels_last) and z.ndim == 4 and z.device.type == "cuda":
+            z = z.contiguous(memory_format=torch.channels_last)
+        return self.vae.decode(z).sample
+
+    def _vae_encode(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            z = self._vae_encode_impl(x)
+            return z.clone() if self._vae_compiled else z
+        except Exception as exc:
+            if self._vae_compiled:
+                self.vae_compile_error = repr(exc)
+                self._vae_compiled = False
+                self._vae_encode_impl = self._vae_encode_eager
+                self._vae_decode_impl = self._vae_decode_eager
+                print(f"[WorldFM][Compile] VAE compiled encode failed, fallback to eager: {exc}", flush=True)
+                return self._vae_encode_impl(x)
+            raise
+
+    def _vae_decode(self, z: torch.Tensor) -> torch.Tensor:
+        try:
+            decoded = self._vae_decode_impl(z)
+            return decoded.clone() if self._vae_compiled else decoded
+        except Exception as exc:
+            if self._vae_compiled:
+                self.vae_compile_error = repr(exc)
+                self._vae_compiled = False
+                self._vae_encode_impl = self._vae_encode_eager
+                self._vae_decode_impl = self._vae_decode_eager
+                print(f"[WorldFM][Compile] VAE compiled decode failed, fallback to eager: {exc}", flush=True)
+                return self._vae_decode_impl(z)
+            raise
+
     # ---- cond2 setters ----
 
     @torch.inference_mode()
     def set_cond2_from_path(self, cond2_path: str) -> None:
         img = Image.open(cond2_path).convert("RGB")
         t = _preprocess_pil_to_tensor(img, target_size_hw=self.target_hw)
-        self._cond2_cached = t.unsqueeze(0).to(self.device).to(self.cfg.weight_dtype)
+        self._cond2_cached = self._vae_input(t.unsqueeze(0).to(self.device))
         self._cond2_latent_cached = None
         self._cond2_candidates_paths = []
         self._cond2_candidates_tensor = None
@@ -178,7 +316,7 @@ class WorldFMTriConditionInprocess:
         """In-memory variant of set_cond2_from_path (no disk I/O)."""
         img = img.convert("RGB")
         t = _preprocess_pil_to_tensor(img, target_size_hw=self.target_hw)
-        self._cond2_cached = t.unsqueeze(0).to(self.device).to(self.cfg.weight_dtype)
+        self._cond2_cached = self._vae_input(t.unsqueeze(0).to(self.device))
         self._cond2_latent_cached = None
         self._cond2_candidates_paths = []
         self._cond2_candidates_tensor = None
@@ -204,14 +342,40 @@ class WorldFMTriConditionInprocess:
             img = Image.open(p).convert("RGB")
             t = _preprocess_pil_to_tensor(img, target_size_hw=self.target_hw)
             tensors_cpu.append(t)
-        cond2 = torch.stack(tensors_cpu).to(self.device).to(self.cfg.weight_dtype)
+        cond2 = self._vae_input(torch.stack(tensors_cpu).to(self.device))
         self._cond2_candidates_tensor = cond2
 
-        vae_scale = getattr(self.vae.config, "scaling_factor", 0.13025)
         latents = []
         for i in range(0, cond2.shape[0], int(chunk)):
             x = cond2[i:i + int(chunk)]
-            z = self.vae.encode(x).latent_dist.sample() * vae_scale
+            z = self._vae_encode(x)
+            latents.append(z)
+        self._cond2_candidates_latent = torch.cat(latents)
+        self._last_cond2_tensor = self._cond2_candidates_tensor[:1]
+
+    @torch.inference_mode()
+    def set_cond2_candidates_from_arrays(self, condition_images: list, *, chunk: int = 8) -> None:
+        """Preprocess and VAE-encode condition RGB uint8 arrays once on GPU."""
+        if not condition_images:
+            raise ValueError("condition_images is empty")
+        self._cond2_candidates_paths = []
+        self._cond2_cached = None
+        self._cond2_latent_cached = None
+
+        tensors_cpu = []
+        for img in condition_images:
+            arr = np.asarray(img, dtype=np.uint8)
+            if arr.ndim != 3 or arr.shape[2] != 3:
+                raise ValueError(f"Expected condition image shape (H,W,3), got {arr.shape}")
+            t = _preprocess_pil_to_tensor(Image.fromarray(arr, mode="RGB"), target_size_hw=self.target_hw)
+            tensors_cpu.append(t)
+        cond2 = self._vae_input(torch.stack(tensors_cpu).to(self.device))
+        self._cond2_candidates_tensor = cond2
+
+        latents = []
+        for i in range(0, cond2.shape[0], int(chunk)):
+            x = cond2[i:i + int(chunk)]
+            z = self._vae_encode(x)
             latents.append(z)
         self._cond2_candidates_latent = torch.cat(latents)
         self._last_cond2_tensor = self._cond2_candidates_tensor[:1]
@@ -240,7 +404,7 @@ class WorldFMTriConditionInprocess:
 
         t0 = time.perf_counter() if use_profile else 0.0
         cond1 = _preprocess_u8_tensor(render_rgb_u8, target_size_hw=self.target_hw).unsqueeze(0)
-        cond1 = cond1.to(self.cfg.weight_dtype)
+        cond1 = self._vae_input(cond1)
         self._last_cond1_tensor = cond1
 
         if self._cond2_cached is not None:
@@ -256,10 +420,9 @@ class WorldFMTriConditionInprocess:
             _sync()
             self._last_profile["cond1_pre_ms"] = (time.perf_counter() - t0) * 1000
 
-        vae_scale = getattr(self.vae.config, "scaling_factor", 0.13025)
         if use_profile:
             t1 = time.perf_counter()
-        z_c1 = self.vae.encode(cond1).latent_dist.sample() * vae_scale
+        z_c1 = self._vae_encode(cond1)
         if use_profile:
             _sync()
             self._last_profile["cond1_vae_ms"] = (time.perf_counter() - t1) * 1000
@@ -268,7 +431,7 @@ class WorldFMTriConditionInprocess:
             if self._cond2_latent_cached is None:
                 if use_profile:
                     t2 = time.perf_counter()
-                self._cond2_latent_cached = self.vae.encode(cond2).latent_dist.sample() * vae_scale
+                self._cond2_latent_cached = self._vae_encode(cond2)
                 if use_profile:
                     _sync()
                     self._last_profile["cond2_vae_ms"] = (time.perf_counter() - t2) * 1000
@@ -277,69 +440,57 @@ class WorldFMTriConditionInprocess:
         latent_h, latent_w = z_c1.shape[2], z_c1.shape[3]
         z = torch.randn(1, 4, latent_h, latent_w, device=self.device, dtype=self.cfg.weight_dtype)
 
-        hw = torch.tensor([[float(self.target_hw[0]), float(self.target_hw[1])]], device=self.device, dtype=self.cfg.weight_dtype)
-        ar = torch.tensor([[float(self.target_hw[0]) / float(self.target_hw[1])]], device=self.device, dtype=self.cfg.weight_dtype)
-        caption_embs = torch.zeros(1, 1, self.max_sequence_length, 4096, device=self.device, dtype=self.cfg.weight_dtype)
-
         def model_fn_wrapper(x, timestep, cond=None, **kwargs):
             kw = kwargs.copy()
             kw["tri_condition"] = True
             return self.model.forward_with_dpmsolver(x, timestep, y=cond, **kw)
 
         model_kwargs = dict(
-            data_info={"img_hw": hw, "aspect_ratio": ar},
+            data_info={"img_hw": self._hw, "aspect_ratio": self._ar},
             mask=None, tri_condition=True,
             cond1=z_c1, cond2=z_c2,
             debug_mask_log=False, use_cond2_cross_attn=False,
         )
 
         if int(self.cfg.step) == 1:
-            diffusion = IDDPM("1000", learn_sigma=True, pred_sigma=True)
-            alphas = torch.from_numpy(diffusion.alphas_cumprod).to(device=self.device, dtype=torch.float32)
-            ts = torch.tensor([999], device=self.device, dtype=torch.long)
-            out = model_fn_wrapper(z, ts, cond=caption_embs, **model_kwargs)
-            eps = out.chunk(2, dim=1)[0] if out.shape[1] == 8 else out
-            a = (alphas[ts] ** 0.5).view(-1, 1, 1, 1)
-            s = ((1 - alphas[ts]) ** 0.5).view(-1, 1, 1, 1)
-            samples = (a * z.float() - s * eps.float()).to(self.cfg.weight_dtype)
-        else:
-            diffusion = IDDPM("1000", learn_sigma=True, pred_sigma=True)
-            alphas = torch.from_numpy(diffusion.alphas_cumprod).to(device=self.device, dtype=torch.float32)
-            mid_t = int(self.cfg.mid_t)
-
-            ts1 = torch.tensor([999], device=self.device, dtype=torch.long)
             if use_profile:
                 t3 = time.perf_counter()
-            out1 = model_fn_wrapper(z, ts1, cond=caption_embs, **model_kwargs)
+            out = model_fn_wrapper(z, self._ts_999, cond=self._caption_embs, **model_kwargs)
+            eps = out.chunk(2, dim=1)[0] if out.shape[1] == 8 else out
+            samples = (self._a_999 * z.float() - self._s_999 * eps.float()).to(self.cfg.weight_dtype)
+            if use_profile:
+                _sync()
+                self._last_profile["denoiser_ms"] = (time.perf_counter() - t3) * 1000
+        else:
+            if use_profile:
+                t3 = time.perf_counter()
+            out1 = model_fn_wrapper(z, self._ts_999, cond=self._caption_embs, **model_kwargs)
             eps1 = out1.chunk(2, dim=1)[0] if out1.shape[1] == 8 else out1
-            a1 = (alphas[ts1] ** 0.5).view(-1, 1, 1, 1)
-            s1 = ((1 - alphas[ts1]) ** 0.5).view(-1, 1, 1, 1)
-            pred_x0 = a1 * z.float() - s1 * eps1.float()
+            pred_x0 = self._a_999 * z.float() - self._s_999 * eps1.float()
             if use_profile:
                 _sync()
                 self._last_profile["dmd_step1_ms"] = (time.perf_counter() - t3) * 1000
 
-            ts_mid = torch.tensor([mid_t], device=self.device, dtype=torch.long)
-            am = (alphas[ts_mid] ** 0.5).view(-1, 1, 1, 1)
-            sm = ((1 - alphas[ts_mid]) ** 0.5).view(-1, 1, 1, 1)
-            noisy = (am * pred_x0 + sm * torch.randn_like(pred_x0)).to(self.cfg.weight_dtype)
+            noisy = (self._a_mid * pred_x0 + self._s_mid * torch.randn_like(pred_x0)).to(self.cfg.weight_dtype)
 
             if use_profile:
                 t4 = time.perf_counter()
-            out2 = model_fn_wrapper(noisy, ts_mid, cond=caption_embs, **model_kwargs)
+            out2 = model_fn_wrapper(noisy, self._ts_mid, cond=self._caption_embs, **model_kwargs)
             eps2 = out2.chunk(2, dim=1)[0] if out2.shape[1] == 8 else out2
-            samples = (am * noisy.float() - sm * eps2.float()).to(self.cfg.weight_dtype)
+            samples = (self._a_mid * noisy.float() - self._s_mid * eps2.float()).to(self.cfg.weight_dtype)
             if use_profile:
                 _sync()
                 self._last_profile["dmd_step2_ms"] = (time.perf_counter() - t4) * 1000
+                self._last_profile["denoiser_ms"] = self._last_profile["dmd_step1_ms"] + self._last_profile["dmd_step2_ms"]
 
         if use_profile:
             t5 = time.perf_counter()
-        decoded = self.vae.decode(samples / vae_scale).sample
+        decoded = self._vae_decode(samples)
         if use_profile:
             _sync()
             self._last_profile["vae_decode_ms"] = (time.perf_counter() - t5) * 1000
-            self._last_profile["total_ms"] = sum(v for k, v in self._last_profile.items() if k.endswith("_ms"))
+            total_keys = ("cond1_pre_ms", "cond1_vae_ms", "cond2_vae_ms", "denoiser_ms", "vae_decode_ms")
+            self._last_profile["total_ms"] = sum(self._last_profile.get(k, 0.0) for k in total_keys)
         return decoded
 
     @torch.inference_mode()
@@ -358,7 +509,7 @@ class WorldFMTriConditionInprocess:
             raise RuntimeError("cond2 not set.")
 
         cond1 = _preprocess_u8_tensor(render_rgb_u8, target_size_hw=self.target_hw).unsqueeze(0)
-        cond1 = cond1.to(self.cfg.weight_dtype)
+        cond1 = self._vae_input(cond1)
         self._last_cond1_tensor = cond1
 
         if self._cond2_cached is not None:
@@ -370,11 +521,10 @@ class WorldFMTriConditionInprocess:
             z_c2 = self._cond2_candidates_latent[ci:ci + 1]  # type: ignore
         self._last_cond2_tensor = cond2
 
-        vae_scale = getattr(self.vae.config, "scaling_factor", 0.13025)
-        z_c1 = self.vae.encode(cond1).latent_dist.sample() * vae_scale
+        z_c1 = self._vae_encode(cond1)
         if z_c2 is None:
             if self._cond2_latent_cached is None:
-                self._cond2_latent_cached = self.vae.encode(cond2).latent_dist.sample() * vae_scale
+                self._cond2_latent_cached = self._vae_encode(cond2)
             z_c2 = self._cond2_latent_cached
 
         latent_h, latent_w = z_c1.shape[2], z_c1.shape[3]
@@ -414,7 +564,7 @@ class WorldFMTriConditionInprocess:
         samples = dpm_solver.sample(z, steps=int(sample_steps), order=2,
                                     skip_type="time_uniform", method="multistep")
         samples = samples.to(self.cfg.weight_dtype)
-        return self.vae.decode(samples / vae_scale).sample
+        return self._vae_decode(samples)
 
     # ---- debug helpers ----
 

@@ -1,8 +1,10 @@
+tmp/
 data/
-outputs/
+outputs*/
 condaenv*
 tests/
 __pycache__/
 plans/
 weights/
+weights
 upload_ckpts.py

@@ -259,6 +259,46 @@ class PixArtWorldFMMS(PixArtWorldFM):
 
         self.initialize()
 
+    def warm_pos_embed_cache(self, *, latent_hw, device=None, dtype=None, width_multiplier=1):
+        """Pre-fill main positional embedding cache before torch.compile tracing."""
+        if isinstance(latent_hw, int):
+            latent_h = latent_w = int(latent_hw)
+        else:
+            latent_h, latent_w = int(latent_hw[0]), int(latent_hw[1])
+        latent_w *= int(width_multiplier)
+        token_h = latent_h // int(self.patch_size)
+        token_w = latent_w // int(self.patch_size)
+        if token_h <= 0 or token_w <= 0:
+            raise ValueError(f"Invalid latent_hw={latent_hw} for patch_size={self.patch_size}")
+
+        if device is None:
+            device = self.pos_embed.device
+        else:
+            device = torch.device(device)
+        if dtype is None:
+            dtype = self.dtype
+
+        cache_key = (
+            token_h,
+            token_w,
+            int(self.pos_embed.shape[-1]),
+            str(device),
+            str(dtype),
+            float(self.pe_interpolation),
+            int(self.base_size),
+        )
+        if cache_key not in self._pos_embed_cache:
+            pos_embed = torch.from_numpy(
+                get_2d_sincos_pos_embed(
+                    self.pos_embed.shape[-1],
+                    (token_h, token_w),
+                    pe_interpolation=self.pe_interpolation,
+                    base_size=self.base_size,
+                )
+            ).unsqueeze(0).to(device=device, dtype=dtype)
+            self._pos_embed_cache[cache_key] = pos_embed
+        return self._pos_embed_cache[cache_key]
+
     def forward(self, x, timestep, y, mask=None, data_info=None, split_output=False, **kwargs):
         """
         Forward pass of PixArtWorldFMMS.
